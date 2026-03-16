@@ -53,6 +53,9 @@ const db = {
   timeBlocks: [], // Bloqueos de tiempo de profesionales
   providers: [], // Proveedores para egresos
   notifications: [], // Historial de notificaciones
+  debts: [], // Deudas de pacientes
+  professionalNotes: [], // Notas del profesional (historia clínica agnóstica)
+  attachments: [], // Archivos adjuntos a notas
 };
 
 // ==================== DATOS DE PRUEBA ====================
@@ -1361,6 +1364,358 @@ app.get('/api/notifications/config', authenticate, (req, res) => {
       templateId: '',
     },
   });
+});
+
+// ==================== ENDPOINTS DE DEUDAS ====================
+
+// GET /api/debts - Listar deudas
+app.get('/api/debts', authenticate, (req, res) => {
+  let debts = req.clinicId 
+    ? db.debts.filter(d => d.clinicId === req.clinicId)
+    : db.debts;
+
+  // Filtrar por paciente si se especifica
+  if (req.query.patientId) {
+    debts = debts.filter(d => d.patientId === req.query.patientId);
+  }
+
+  // Filtrar por estado
+  if (req.query.status) {
+    debts = debts.filter(d => d.status === req.query.status);
+  }
+
+  // Calcular totales
+  const totalDebt = debts
+    .filter(d => d.status === 'PENDING' || d.status === 'PARTIAL')
+    .reduce((sum, d) => sum + d.remainingAmount, 0);
+
+  const totalPaid = debts
+    .filter(d => d.status === 'PAID')
+    .reduce((sum, d) => sum + d.amount, 0);
+
+  // Incluir datos del paciente
+  const debtsWithPatient = debts.map(debt => {
+    const patient = db.patients.find(p => p.id === debt.patientId);
+    return { ...debt, patient };
+  });
+
+  res.json({
+    debts: debtsWithPatient,
+    summary: {
+      totalDebt,
+      totalPaid,
+      count: debts.length,
+      pendingCount: debts.filter(d => d.status === 'PENDING').length,
+    }
+  });
+});
+
+// GET /api/debts/patient/:patientId - Obtener deudas de un paciente
+app.get('/api/debts/patient/:patientId', authenticate, (req, res) => {
+  const { patientId } = req.params;
+  
+  const patient = db.patients.find(p => p.id === patientId);
+  if (!patient) {
+    return res.status(404).json({ error: 'Paciente no encontrado' });
+  }
+
+  let debts = db.debts.filter(d => d.patientId === patientId);
+  
+  if (req.clinicId) {
+    debts = debts.filter(d => d.clinicId === req.clinicId);
+  }
+
+  const totalDebt = debts
+    .filter(d => d.status === 'PENDING' || d.status === 'PARTIAL')
+    .reduce((sum, d) => sum + d.remainingAmount, 0);
+
+  res.json({
+    patient,
+    debts,
+    totalDebt,
+  });
+});
+
+// POST /api/debts - Crear deuda
+app.post('/api/debts', authenticate, (req, res) => {
+  const { patientId, amount, reason, appointmentId, notes } = req.body;
+  
+  const patient = db.patients.find(p => p.id === patientId);
+  if (!patient) {
+    return res.status(404).json({ error: 'Paciente no encontrado' });
+  }
+
+  const debt = {
+    id: `debt-${Date.now()}`,
+    clinicId: req.clinicId,
+    patientId,
+    amount: parseFloat(amount),
+    remainingAmount: parseFloat(amount),
+    paidAmount: 0,
+    reason: reason || 'Deuda pendiente',
+    appointmentId: appointmentId || null,
+    notes: notes || '',
+    status: 'PENDING',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  
+  db.debts.push(debt);
+  
+  res.status(201).json({
+    message: 'Deuda registrada',
+    debt: { ...debt, patient }
+  });
+});
+
+// POST /api/debts/:id/payment - Registrar pago de deuda
+app.post('/api/debts/:id/payment', authenticate, (req, res) => {
+  const { amount, method, notes } = req.body;
+  const debtIndex = db.debts.findIndex(d => d.id === req.params.id);
+  
+  if (debtIndex === -1) {
+    return res.status(404).json({ error: 'Deuda no encontrada' });
+  }
+
+  const debt = db.debts[debtIndex];
+  
+  if (req.clinicId && debt.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  const paymentAmount = parseFloat(amount);
+  const newPaidAmount = debt.paidAmount + paymentAmount;
+  const newRemainingAmount = debt.amount - newPaidAmount;
+
+  // Determinar nuevo estado
+  let newStatus = 'PARTIAL';
+  if (newRemainingAmount <= 0) {
+    newStatus = 'PAID';
+  }
+
+  db.debts[debtIndex] = {
+    ...debt,
+    paidAmount: newPaidAmount,
+    remainingAmount: Math.max(0, newRemainingAmount),
+    status: newStatus,
+    updatedAt: new Date().toISOString(),
+  };
+
+  // Crear registro de pago asociado
+  const payment = {
+    id: `payment-${Date.now()}`,
+    clinicId: req.clinicId,
+    patientId: debt.patientId,
+    debtId: debt.id,
+    amount: paymentAmount,
+    method: method || 'CASH',
+    concept: `Pago de deuda: ${debt.reason}`,
+    notes: notes || '',
+    paidAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  };
+  
+  db.payments.push(payment);
+
+  const patient = db.patients.find(p => p.id === debt.patientId);
+
+  res.json({
+    message: newStatus === 'PAID' ? 'Deuda saldada completamente' : 'Pago registrado',
+    debt: { ...db.debts[debtIndex], patient },
+    payment,
+  });
+});
+
+// DELETE /api/debts/:id - Eliminar deuda
+app.delete('/api/debts/:id', authenticate, (req, res) => {
+  const index = db.debts.findIndex(d => d.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Deuda no encontrada' });
+  }
+
+  const debt = db.debts[index];
+  
+  if (req.clinicId && debt.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.debts.splice(index, 1);
+  res.json({ message: 'Deuda eliminada' });
+});
+
+// ==================== ENDPOINTS DE NOTAS DEL PROFESIONAL ====================
+
+// GET /api/professional-notes - Listar notas
+app.get('/api/professional-notes', authenticate, (req, res) => {
+  let notes = req.clinicId 
+    ? db.professionalNotes.filter(n => n.clinicId === req.clinicId)
+    : db.professionalNotes;
+
+  if (req.query.patientId) {
+    notes = notes.filter(n => n.patientId === req.query.patientId);
+  }
+
+  if (req.query.appointmentId) {
+    notes = notes.filter(n => n.appointmentId === req.query.appointmentId);
+  }
+
+  // Incluir datos del paciente y profesional
+  const notesWithData = notes.map(note => {
+    const patient = db.patients.find(p => p.id === note.patientId);
+    const professional = db.professionals.find(p => p.id === note.professionalId);
+    const attachments = db.attachments.filter(a => a.noteId === note.id);
+    return { ...note, patient, professional, attachments };
+  });
+
+  res.json(notesWithData);
+});
+
+// GET /api/professional-notes/:id - Obtener nota por ID
+app.get('/api/professional-notes/:id', authenticate, (req, res) => {
+  const note = db.professionalNotes.find(n => n.id === req.params.id);
+  
+  if (!note) {
+    return res.status(404).json({ error: 'Nota no encontrada' });
+  }
+
+  if (req.clinicId && note.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  const patient = db.patients.find(p => p.id === note.patientId);
+  const professional = db.professionals.find(p => p.id === note.professionalId);
+  const attachments = db.attachments.filter(a => a.noteId === note.id);
+
+  res.json({ ...note, patient, professional, attachments });
+});
+
+// POST /api/professional-notes - Crear nota
+app.post('/api/professional-notes', authenticate, (req, res) => {
+  const { patientId, appointmentId, professionalId, title, content, tags } = req.body;
+  
+  const patient = db.patients.find(p => p.id === patientId);
+  if (!patient) {
+    return res.status(404).json({ error: 'Paciente no encontrado' });
+  }
+
+  const note = {
+    id: `note-${Date.now()}`,
+    clinicId: req.clinicId,
+    patientId,
+    appointmentId: appointmentId || null,
+    professionalId: professionalId || req.userId,
+    title: title || 'Nota',
+    content: content || '',
+    tags: tags || [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  
+  db.professionalNotes.push(note);
+
+  const professional = db.professionals.find(p => p.id === note.professionalId);
+
+  res.status(201).json({
+    message: 'Nota registrada',
+    note: { ...note, patient, professional, attachments: [] }
+  });
+});
+
+// PUT /api/professional-notes/:id - Actualizar nota
+app.put('/api/professional-notes/:id', authenticate, (req, res) => {
+  const index = db.professionalNotes.findIndex(n => n.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Nota no encontrada' });
+  }
+
+  const note = db.professionalNotes[index];
+  
+  if (req.clinicId && note.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.professionalNotes[index] = {
+    ...note,
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const patient = db.patients.find(p => p.id === note.patientId);
+  const professional = db.professionals.find(p => p.id === db.professionalNotes[index].professionalId);
+  const attachments = db.attachments.filter(a => a.noteId === note.id);
+
+  res.json({
+    message: 'Nota actualizada',
+    note: { ...db.professionalNotes[index], patient, professional, attachments }
+  });
+});
+
+// DELETE /api/professional-notes/:id - Eliminar nota
+app.delete('/api/professional-notes/:id', authenticate, (req, res) => {
+  const index = db.professionalNotes.findIndex(n => n.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Nota no encontrada' });
+  }
+
+  const note = db.professionalNotes[index];
+  
+  if (req.clinicId && note.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  // Eliminar adjuntos asociados
+  db.attachments = db.attachments.filter(a => a.noteId !== req.params.id);
+  
+  db.professionalNotes.splice(index, 1);
+  res.json({ message: 'Nota eliminada' });
+});
+
+// POST /api/professional-notes/:id/attachments - Agregar adjunto
+app.post('/api/professional-notes/:id/attachments', authenticate, (req, res) => {
+  const note = db.professionalNotes.find(n => n.id === req.params.id);
+  
+  if (!note) {
+    return res.status(404).json({ error: 'Nota no encontrada' });
+  }
+
+  if (req.clinicId && note.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  const { fileName, fileType, fileUrl, description } = req.body;
+
+  const attachment = {
+    id: `attachment-${Date.now()}`,
+    noteId: req.params.id,
+    fileName: fileName || 'archivo',
+    fileType: fileType || 'application/octet-stream',
+    fileUrl: fileUrl || '',
+    description: description || '',
+    uploadedBy: req.userId,
+    createdAt: new Date().toISOString(),
+  };
+  
+  db.attachments.push(attachment);
+
+  res.status(201).json({
+    message: 'Adjunto agregado',
+    attachment
+  });
+});
+
+// DELETE /api/attachments/:id - Eliminar adjunto
+app.delete('/api/attachments/:id', authenticate, (req, res) => {
+  const index = db.attachments.findIndex(a => a.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Adjunto no encontrado' });
+  }
+
+  db.attachments.splice(index, 1);
+  res.json({ message: 'Adjunto eliminado' });
 });
 
 // ==================== ERROR HANDLING ====================
