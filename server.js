@@ -51,6 +51,8 @@ const db = {
   payments: [],
   professionals: [],
   timeBlocks: [], // Bloqueos de tiempo de profesionales
+  providers: [], // Proveedores para egresos
+  notifications: [], // Historial de notificaciones
 };
 
 // ==================== DATOS DE PRUEBA ====================
@@ -238,6 +240,36 @@ async function initData() {
         saturday: { start: '10:00', end: '14:00' },
         sunday: null,
       },
+      createdAt: new Date().toISOString(),
+    }
+  );
+
+  // Proveedores de ejemplo
+  db.providers.push(
+    {
+      id: 'provider-001',
+      clinicId: 'clinic-001',
+      name: 'Distribuidora Médica S.A.',
+      rut: '76.123.456-7',
+      address: 'Av. Industrial 1234, Santiago',
+      phone: '+56 2 2345 6789',
+      email: 'ventas@distmedica.cl',
+      contactName: 'Juan Pérez',
+      notes: 'Proveedor principal de insumos médicos',
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: 'provider-002',
+      clinicId: 'clinic-001',
+      name: 'Laboratorios Dentales Ltda.',
+      rut: '76.987.654-3',
+      address: 'Calle Los Andes 567, Providencia',
+      phone: '+56 2 3456 7890',
+      email: 'contacto@labdentales.cl',
+      contactName: 'María González',
+      notes: 'Prótesis dentales y laboratorio',
+      isActive: true,
       createdAt: new Date().toISOString(),
     }
   );
@@ -1004,6 +1036,331 @@ app.put('/api/users/:id', authenticate, async (req, res) => {
   
   const { password: _, ...userWithoutPassword } = db.users[index];
   res.json(userWithoutPassword);
+});
+
+// PATCH /api/appointments/:id/status - Cambiar estado de cita
+app.patch('/api/appointments/:id/status', authenticate, (req, res) => {
+  const { status } = req.body;
+  const index = db.appointments.findIndex(a => a.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Cita no encontrada' });
+  }
+
+  const appointment = db.appointments[index];
+  
+  // Verificar que la cita pertenece a la clínica del usuario
+  if (req.clinicId && appointment.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.appointments[index] = {
+    ...appointment,
+    status,
+    updatedAt: new Date().toISOString(),
+  };
+
+  // Incluir datos relacionados en la respuesta
+  const patient = db.patients.find(p => p.id === appointment.patientId);
+  const service = db.services.find(s => s.id === appointment.serviceId);
+  const professional = db.professionals.find(p => p.id === appointment.professionalId);
+
+  res.json({
+    message: 'Estado actualizado',
+    appointment: { ...db.appointments[index], patient, service, professional }
+  });
+});
+
+// GET /api/appointments/:id - Obtener cita por ID
+app.get('/api/appointments/:id', authenticate, (req, res) => {
+  const appointment = db.appointments.find(a => a.id === req.params.id);
+  
+  if (!appointment) {
+    return res.status(404).json({ error: 'Cita no encontrada' });
+  }
+
+  if (req.clinicId && appointment.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  const patient = db.patients.find(p => p.id === appointment.patientId);
+  const service = db.services.find(s => s.id === appointment.serviceId);
+  const professional = db.professionals.find(p => p.id === appointment.professionalId);
+
+  res.json({ ...appointment, patient, service, professional });
+});
+
+// PUT /api/appointments/:id - Actualizar cita
+app.put('/api/appointments/:id', authenticate, (req, res) => {
+  const index = db.appointments.findIndex(a => a.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Cita no encontrada' });
+  }
+
+  const appointment = db.appointments[index];
+  
+  if (req.clinicId && appointment.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.appointments[index] = {
+    ...appointment,
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const patient = db.patients.find(p => p.id === db.appointments[index].patientId);
+  const service = db.services.find(s => s.id === db.appointments[index].serviceId);
+  const professional = db.professionals.find(p => p.id === db.appointments[index].professionalId);
+
+  res.json({
+    message: 'Cita actualizada',
+    appointment: { ...db.appointments[index], patient, service, professional }
+  });
+});
+
+// DELETE /api/appointments/:id - Eliminar cita
+app.delete('/api/appointments/:id', authenticate, (req, res) => {
+  const index = db.appointments.findIndex(a => a.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Cita no encontrada' });
+  }
+
+  const appointment = db.appointments[index];
+  
+  if (req.clinicId && appointment.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.appointments.splice(index, 1);
+  res.json({ message: 'Cita eliminada' });
+});
+
+// ==================== ENDPOINTS DE PROVEEDORES ====================
+
+// GET /api/providers - Listar proveedores
+app.get('/api/providers', authenticate, (req, res) => {
+  let providers = req.clinicId 
+    ? db.providers.filter(p => p.clinicId === req.clinicId)
+    : db.providers;
+
+  if (req.query.active === 'true') {
+    providers = providers.filter(p => p.isActive);
+  }
+
+  res.json(providers);
+});
+
+// GET /api/providers/:id - Obtener proveedor por ID
+app.get('/api/providers/:id', authenticate, (req, res) => {
+  const provider = db.providers.find(p => p.id === req.params.id);
+  
+  if (!provider) {
+    return res.status(404).json({ error: 'Proveedor no encontrado' });
+  }
+
+  if (req.clinicId && provider.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  res.json(provider);
+});
+
+// POST /api/providers - Crear proveedor
+app.post('/api/providers', authenticate, (req, res) => {
+  const { name, rut, address, phone, email, contactName, notes } = req.body;
+  
+  const provider = {
+    id: `provider-${Date.now()}`,
+    clinicId: req.clinicId,
+    name,
+    rut: rut || '',
+    address: address || '',
+    phone: phone || '',
+    email: email || '',
+    contactName: contactName || '',
+    notes: notes || '',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+  };
+  
+  db.providers.push(provider);
+  res.status(201).json({ message: 'Proveedor creado', provider });
+});
+
+// PUT /api/providers/:id - Actualizar proveedor
+app.put('/api/providers/:id', authenticate, (req, res) => {
+  const index = db.providers.findIndex(p => p.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Proveedor no encontrado' });
+  }
+
+  const provider = db.providers[index];
+  
+  if (req.clinicId && provider.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.providers[index] = {
+    ...provider,
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  };
+  
+  res.json({ message: 'Proveedor actualizado', provider: db.providers[index] });
+});
+
+// DELETE /api/providers/:id - Eliminar proveedor
+app.delete('/api/providers/:id', authenticate, (req, res) => {
+  const index = db.providers.findIndex(p => p.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Proveedor no encontrado' });
+  }
+
+  const provider = db.providers[index];
+  
+  if (req.clinicId && provider.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.providers.splice(index, 1);
+  res.json({ message: 'Proveedor eliminado' });
+});
+
+// ==================== ENDPOINTS DE NOTIFICACIONES ====================
+
+// GET /api/notifications - Listar notificaciones
+app.get('/api/notifications', authenticate, (req, res) => {
+  let notifications = req.clinicId 
+    ? db.notifications.filter(n => n.clinicId === req.clinicId)
+    : db.notifications;
+
+  if (req.query.patientId) {
+    notifications = notifications.filter(n => n.patientId === req.query.patientId);
+  }
+
+  if (req.query.status) {
+    notifications = notifications.filter(n => n.status === req.query.status);
+  }
+
+  res.json({ 
+    data: notifications.slice().reverse(), 
+    pagination: { page: 1, limit: 100, total: notifications.length, pages: 1 } 
+  });
+});
+
+// POST /api/notifications - Enviar notificación
+app.post('/api/notifications', authenticate, (req, res) => {
+  const { patientId, type, subject, message, appointmentId } = req.body;
+  
+  const patient = db.patients.find(p => p.id === patientId);
+  
+  if (!patient) {
+    return res.status(404).json({ error: 'Paciente no encontrado' });
+  }
+
+  // Crear registro de notificación
+  const notification = {
+    id: `notification-${Date.now()}`,
+    clinicId: req.clinicId,
+    patientId,
+    type,
+    subject,
+    message,
+    appointmentId: appointmentId || null,
+    status: 'SENT',
+    sentAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  };
+  
+  db.notifications.push(notification);
+
+  // Generar URL de WhatsApp Web si es necesario
+  let whatsappUrl = null;
+  if (type === 'WHATSAPP' && patient.phone) {
+    const cleanPhone = patient.phone.replace(/\D/g, '');
+    whatsappUrl = `https://wa.me/${cleanPhone}?text=${encodeURIComponent(message)}`;
+  }
+
+  res.status(201).json({
+    message: 'Notificación enviada',
+    notification,
+    whatsappUrl,
+  });
+});
+
+// POST /api/notifications/reminders - Enviar recordatorios
+app.post('/api/notifications/reminders', authenticate, (req, res) => {
+  const { days = 1 } = req.body;
+  
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + days);
+  const dateStr = targetDate.toISOString().split('T')[0];
+  
+  const appointments = db.appointments.filter(a => 
+    a.clinicId === req.clinicId && 
+    a.date === dateStr && 
+    (a.status === 'PENDING' || a.status === 'CONFIRMED') &&
+    !a.reminderSent
+  );
+
+  const reminders = appointments.map(appointment => {
+    const patient = db.patients.find(p => p.id === appointment.patientId);
+    const service = db.services.find(s => s.id === appointment.serviceId);
+    
+    const message = `Hola ${patient?.firstName || ''},\n\nTe recordamos tu cita:\n\n📅 Fecha: ${appointment.date}\n🕐 Hora: ${appointment.time}\n🦷 Servicio: ${service?.name || ''}\n\nTe esperamos!`;
+
+    const notification = {
+      id: `notification-${Date.now()}-${appointment.id}`,
+      clinicId: req.clinicId,
+      patientId: appointment.patientId,
+      type: 'WHATSAPP',
+      subject: 'Recordatorio de cita',
+      message,
+      appointmentId: appointment.id,
+      status: 'SENT',
+      sentAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    };
+    
+    db.notifications.push(notification);
+    
+    // Marcar recordatorio como enviado
+    const appIndex = db.appointments.findIndex(a => a.id === appointment.id);
+    if (appIndex !== -1) {
+      db.appointments[appIndex].reminderSent = true;
+    }
+
+    const cleanPhone = patient?.phone?.replace(/\D/g, '');
+    const whatsappUrl = cleanPhone ? `https://wa.me/${cleanPhone}?text=${encodeURIComponent(message)}` : null;
+
+    return {
+      appointment,
+      notification,
+      whatsappUrl,
+    };
+  });
+
+  res.json({
+    message: `${reminders.length} recordatorios enviados`,
+    reminders,
+  });
+});
+
+// GET /api/notifications/config - Verificar configuración de email
+app.get('/api/notifications/config', authenticate, (req, res) => {
+  res.json({
+    configured: false,
+    config: {
+      publicKey: '',
+      serviceId: '',
+      templateId: '',
+    },
+  });
 });
 
 // ==================== ERROR HANDLING ====================
