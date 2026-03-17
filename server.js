@@ -43,7 +43,9 @@ const db = {
       whatsappEnabled: true,
       clientType: 'patient', // 'patient' | 'client' | 'customer' | 'guest'
       clientTypeLabel: 'Paciente', // Etiqueta personalizada
-      countryCode: '+34', // Código de país para teléfonos
+      professionalType: 'professional', // 'professional' | 'doctor' | 'stylist' | 'therapist'
+      professionalTypeLabel: 'Profesional', // Etiqueta personalizada
+      countryCode: '+598', // Uruguay por defecto
       createdAt: new Date().toISOString(),
     }
   ],
@@ -458,14 +460,16 @@ app.post('/api/clinics', authenticate, (req, res) => {
     return res.status(403).json({ error: 'No tienes permisos' });
   }
 
-  const { clientType, clientTypeLabel, countryCode, ...otherData } = req.body;
+  const { clientType, clientTypeLabel, professionalType, professionalTypeLabel, countryCode, ...otherData } = req.body;
   
   const clinic = {
     id: `clinic-${Date.now()}`,
     ...otherData,
-    clientType: clientType || 'patient', // 'patient' | 'client' | 'customer' | 'guest'
+    clientType: clientType || 'patient',
     clientTypeLabel: clientTypeLabel || getDefaultClientTypeLabel(clientType || 'patient'),
-    countryCode: countryCode || '+34',
+    professionalType: professionalType || 'professional',
+    professionalTypeLabel: professionalTypeLabel || getDefaultProfessionalTypeLabel(professionalType || 'professional'),
+    countryCode: countryCode || '+598', // Uruguay por defecto
     isActive: true,
     plan: 'free',
     whatsappEnabled: true,
@@ -476,7 +480,7 @@ app.post('/api/clinics', authenticate, (req, res) => {
   res.status(201).json({ message: 'Clínica creada', clinic });
 });
 
-// Helper para obtener etiqueta por defecto según el tipo
+// Helper para obtener etiqueta de cliente por defecto
 function getDefaultClientTypeLabel(type) {
   const labels = {
     patient: 'Paciente',
@@ -487,6 +491,19 @@ function getDefaultClientTypeLabel(type) {
     member: 'Miembro',
   };
   return labels[type] || 'Paciente';
+}
+
+// Helper para obtener etiqueta de profesional por defecto
+function getDefaultProfessionalTypeLabel(type) {
+  const labels = {
+    professional: 'Profesional',
+    doctor: 'Doctor',
+    stylist: 'Estilista',
+    therapist: 'Terapeuta',
+    trainer: 'Entrenador',
+    consultant: 'Consultor',
+  };
+  return labels[type] || 'Profesional';
 }
 
 // PUT /api/clinics/:id
@@ -563,12 +580,30 @@ app.get('/api/dashboard', authenticate, (req, res) => {
   // Calcular métricas por profesional
   const professionals = db.professionals.filter(p => p.clinicId === clinicId);
   const revenueByProfessional = professionals.map(prof => {
+    // Citas completadas por este profesional
     const profAppointments = appointments.filter(a => a.professionalId === prof.id && a.status === 'COMPLETED');
+    
+    // Ingreso generado por citas (suma de precios de citas completadas)
     const profRevenue = profAppointments.reduce((sum, a) => sum + (a.price || 0), 0);
+    
+    // Pagos recibidos asociados a citas de este profesional
     const profPayments = payments.filter(p => {
-      const relatedAppointment = appointments.find(a => a.id === p.appointmentId && a.professionalId === prof.id);
-      return relatedAppointment;
+      // Pago directamente asociado a una cita
+      if (p.appointmentId) {
+        const relatedAppointment = appointments.find(a => a.id === p.appointmentId);
+        return relatedAppointment && relatedAppointment.professionalId === prof.id;
+      }
+      // Pago asociado a una deuda que viene de una cita
+      if (p.debtId) {
+        const relatedDebt = db.debts.find(d => d.id === p.debtId);
+        if (relatedDebt && relatedDebt.appointmentId) {
+          const relatedAppointment = appointments.find(a => a.id === relatedDebt.appointmentId);
+          return relatedAppointment && relatedAppointment.professionalId === prof.id;
+        }
+      }
+      return false;
     });
+    
     const totalReceived = profPayments.reduce((sum, p) => sum + p.amount, 0);
     
     return {
@@ -578,7 +613,7 @@ app.get('/api/dashboard', authenticate, (req, res) => {
       appointmentsCount: profAppointments.length,
       revenue: profRevenue,
       received: totalReceived,
-      pending: profRevenue - totalReceived,
+      pending: Math.max(0, profRevenue - totalReceived),
     };
   }).sort((a, b) => b.revenue - a.revenue);
 
@@ -610,7 +645,33 @@ app.get('/api/dashboard', authenticate, (req, res) => {
     
     // Asumir 8 horas por día por profesional
     const hoursPerDay = 8;
-    const totalAvailableSlots = professionals.length * workingDays * hoursPerDay;
+    
+    // Calcular bloqueos de tiempo del mes (reducen disponibilidad)
+    const monthTimeBlocks = db.timeBlocks.filter(b => {
+      const blockDate = new Date(b.date);
+      return b.clinicId === clinicId && blockDate >= startOfMonth && blockDate <= endOfMonth;
+    });
+    
+    // Horas bloqueadas por profesional
+    const blockedHoursByProfessional = {};
+    monthTimeBlocks.forEach(block => {
+      if (!blockedHoursByProfessional[block.professionalId]) {
+        blockedHoursByProfessional[block.professionalId] = 0;
+      }
+      // Calcular horas bloqueadas (asumiendo formato HH:MM)
+      const [startH, startM] = block.startTime.split(':').map(Number);
+      const [endH, endM] = block.endTime.split(':').map(Number);
+      const hours = (endH + endM / 60) - (startH + startM / 60);
+      blockedHoursByProfessional[block.professionalId] += hours;
+    });
+    
+    // Calcular slots disponibles restando bloqueos
+    let totalAvailableSlots = 0;
+    professionals.forEach(prof => {
+      const profWorkingHours = hoursPerDay * workingDays;
+      const profBlockedHours = blockedHoursByProfessional[prof.id] || 0;
+      totalAvailableSlots += Math.max(0, profWorkingHours - profBlockedHours);
+    });
     
     // Citas del mes actual
     const monthAppointments = appointments.filter(a => {
@@ -630,6 +691,7 @@ app.get('/api/dashboard', authenticate, (req, res) => {
       totalSlots: totalAvailableSlots,
       occupiedSlots,
       workingDays,
+      blockedHours: Object.values(blockedHoursByProfessional).reduce((a, b) => a + b, 0),
     };
   };
 
@@ -814,8 +876,38 @@ app.get('/api/time-blocks', authenticate, (req, res) => {
 
 // POST /api/time-blocks - Crear bloqueo de tiempo
 app.post('/api/time-blocks', authenticate, (req, res) => {
-  const { professionalId, date, startTime, endTime, reason } = req.body;
+  const { professionalId, date, startTime, endTime, reason, startDate, endDate } = req.body;
   
+  // Si se proporciona un rango de fechas, crear múltiples bloqueos
+  if (startDate && endDate) {
+    const blocks = [];
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const block = {
+        id: `block-${Date.now()}-${d.getTime()}`,
+        clinicId: req.clinicId,
+        professionalId,
+        date: d.toISOString().split('T')[0],
+        startTime: startTime || '00:00',
+        endTime: endTime || '23:59',
+        reason: reason || 'Bloqueado',
+        createdAt: new Date().toISOString(),
+      };
+      db.timeBlocks.push(block);
+      blocks.push(block);
+    }
+    
+    res.status(201).json({ 
+      message: `${blocks.length} bloqueos creados`, 
+      blocks,
+      count: blocks.length
+    });
+    return;
+  }
+  
+  // Bloqueo de un solo día
   const block = {
     id: `block-${Date.now()}`,
     clinicId: req.clinicId,
@@ -1052,6 +1144,24 @@ app.post('/api/payments', authenticate, (req, res) => {
     message: 'Pago registrado', 
     payment: { ...payment, patient }
   });
+});
+
+// DELETE /api/payments/:id - Eliminar pago
+app.delete('/api/payments/:id', authenticate, (req, res) => {
+  const index = db.payments.findIndex(p => p.id === req.params.id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Pago no encontrado' });
+  }
+
+  const payment = db.payments[index];
+  
+  if (req.clinicId && payment.clinicId !== req.clinicId) {
+    return res.status(403).json({ error: 'No tienes permisos' });
+  }
+
+  db.payments.splice(index, 1);
+  res.json({ message: 'Pago eliminado' });
 });
 
 // GET /api/payments/summary
@@ -1615,6 +1725,7 @@ app.post('/api/debts/:id/payment', authenticate, (req, res) => {
     clinicId: req.clinicId,
     patientId: debt.patientId,
     debtId: debt.id,
+    appointmentId: debt.appointmentId, // Guardar referencia a la cita si existe
     amount: paymentAmount,
     method: method || 'CASH',
     concept: `Pago de deuda: ${debt.reason}`,
