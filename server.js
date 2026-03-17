@@ -41,6 +41,9 @@ const db = {
       isActive: true,
       plan: 'free',
       whatsappEnabled: true,
+      clientType: 'patient', // 'patient' | 'client' | 'customer' | 'guest'
+      clientTypeLabel: 'Paciente', // Etiqueta personalizada
+      countryCode: '+34', // Código de país para teléfonos
       createdAt: new Date().toISOString(),
     }
   ],
@@ -455,9 +458,14 @@ app.post('/api/clinics', authenticate, (req, res) => {
     return res.status(403).json({ error: 'No tienes permisos' });
   }
 
+  const { clientType, clientTypeLabel, countryCode, ...otherData } = req.body;
+  
   const clinic = {
     id: `clinic-${Date.now()}`,
-    ...req.body,
+    ...otherData,
+    clientType: clientType || 'patient', // 'patient' | 'client' | 'customer' | 'guest'
+    clientTypeLabel: clientTypeLabel || getDefaultClientTypeLabel(clientType || 'patient'),
+    countryCode: countryCode || '+34',
     isActive: true,
     plan: 'free',
     whatsappEnabled: true,
@@ -467,6 +475,19 @@ app.post('/api/clinics', authenticate, (req, res) => {
   db.clinics.push(clinic);
   res.status(201).json({ message: 'Clínica creada', clinic });
 });
+
+// Helper para obtener etiqueta por defecto según el tipo
+function getDefaultClientTypeLabel(type) {
+  const labels = {
+    patient: 'Paciente',
+    client: 'Cliente',
+    customer: 'Cliente',
+    guest: 'Huésped',
+    student: 'Estudiante',
+    member: 'Miembro',
+  };
+  return labels[type] || 'Paciente';
+}
 
 // PUT /api/clinics/:id
 app.put('/api/clinics/:id', authenticate, (req, res) => {
@@ -539,6 +560,87 @@ app.get('/api/dashboard', authenticate, (req, res) => {
     service: services.find(s => s.id === a.serviceId),
   }));
 
+  // Calcular métricas por profesional
+  const professionals = db.professionals.filter(p => p.clinicId === clinicId);
+  const revenueByProfessional = professionals.map(prof => {
+    const profAppointments = appointments.filter(a => a.professionalId === prof.id && a.status === 'COMPLETED');
+    const profRevenue = profAppointments.reduce((sum, a) => sum + (a.price || 0), 0);
+    const profPayments = payments.filter(p => {
+      const relatedAppointment = appointments.find(a => a.id === p.appointmentId && a.professionalId === prof.id);
+      return relatedAppointment;
+    });
+    const totalReceived = profPayments.reduce((sum, p) => sum + p.amount, 0);
+    
+    return {
+      professionalId: prof.id,
+      professionalName: `${prof.firstName} ${prof.lastName}`,
+      specialty: prof.specialty,
+      appointmentsCount: profAppointments.length,
+      revenue: profRevenue,
+      received: totalReceived,
+      pending: profRevenue - totalReceived,
+    };
+  }).sort((a, b) => b.revenue - a.revenue);
+
+  // Calcular métricas por servicio
+  const revenueByService = services.map(svc => {
+    const svcAppointments = appointments.filter(a => a.serviceId === svc.id && a.status === 'COMPLETED');
+    const svcRevenue = svcAppointments.reduce((sum, a) => sum + (a.price || 0), 0);
+    
+    return {
+      serviceId: svc.id,
+      serviceName: svc.name,
+      appointmentsCount: svcAppointments.length,
+      revenue: svcRevenue,
+    };
+  }).sort((a, b) => b.revenue - a.revenue);
+
+  // Calcular % de ocupación de agenda
+  const calculateOccupancy = () => {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    
+    // Contar días hábiles del mes (Lun-Vie)
+    let workingDays = 0;
+    for (let d = new Date(startOfMonth); d <= endOfMonth; d.setDate(d.getDate() + 1)) {
+      const dayOfWeek = d.getDay();
+      if (dayOfWeek >= 1 && dayOfWeek <= 5) workingDays++;
+    }
+    
+    // Asumir 8 horas por día por profesional
+    const hoursPerDay = 8;
+    const totalAvailableSlots = professionals.length * workingDays * hoursPerDay;
+    
+    // Citas del mes actual
+    const monthAppointments = appointments.filter(a => {
+      const appDate = new Date(a.date);
+      return appDate >= startOfMonth && appDate <= endOfMonth;
+    });
+    
+    // Asumir que cada cita dura 1 hora en promedio
+    const occupiedSlots = monthAppointments.length;
+    
+    const occupancyRate = totalAvailableSlots > 0 
+      ? Math.round((occupiedSlots / totalAvailableSlots) * 100)
+      : 0;
+    
+    return {
+      occupancyRate,
+      totalSlots: totalAvailableSlots,
+      occupiedSlots,
+      workingDays,
+    };
+  };
+
+  const occupancy = calculateOccupancy();
+
+  // Calcular deuda total
+  const clinicDebts = db.debts.filter(d => d.clinicId === clinicId);
+  const totalDebt = clinicDebts
+    .filter(d => d.status === 'PENDING' || d.status === 'PARTIAL')
+    .reduce((sum, d) => sum + d.remainingAmount, 0);
+
   res.json({
     stats: {
       totalPatients: patients.length,
@@ -550,7 +652,13 @@ app.get('/api/dashboard', authenticate, (req, res) => {
       todayRevenue: todayAppointments.reduce((sum, a) => sum + (a.price || 0), 0),
       monthRevenue: monthPayments.reduce((sum, p) => sum + p.amount, 0),
       totalRevenue: payments.reduce((sum, p) => sum + p.amount, 0),
-      totalDebt: 0,
+      totalDebt,
+      occupancyRate: occupancy.occupancyRate,
+    },
+    analytics: {
+      revenueByProfessional,
+      revenueByService,
+      occupancy,
     },
     recent: {
       patients: recentPatients,
